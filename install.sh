@@ -57,10 +57,10 @@ install -d -m 0700 /etc/wg-tun
 next_manager=$(mktemp "$lib/.manager.XXXXXXXX")
 trap 'rm -f "$next_manager"' EXIT
 install -m 0755 manager.py "$next_manager"
-mv -f "$next_manager" "$lib/manager.py"
 install -m 0755 wg "$lib/wg"
 ln -sfn "$lib/manager.py" "$bin"
 ln -sfn "$lib/wg" /usr/local/bin/wg
 install -m 0644 systemd/wg-tun.service "$units/"
 systemctl daemon-reload
+mv -f "$next_manager" "$lib/manager.py"
 echo '原生 WireGuard 管理器已安装。输入 wg 即可打开中文菜单。'

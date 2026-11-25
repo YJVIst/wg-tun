@@ -1,5 +1,9 @@
 import base64
 import io
+import hashlib
+import json
+import shlex
+import tempfile
 from contextlib import redirect_stdout
 from subprocess import CompletedProcess
 from pathlib import Path
@@ -96,6 +100,30 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn(KEY, output.getvalue())
             self.assertIn('[2001:db8::1]:51820', output.getvalue())
             self.assertIn('IPv6 全隧道', output.getvalue())
+
+    def test_updater_validates_package_before_install_and_reads_installed_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = Path(tmp) / 'manager.py'
+            manager.write_text("print('v1.1.0')\n")
+            code = f"print('{m.VERSION}')"
+            pkg = f"printf '%s\\n' {shlex.quote(code)} > {shlex.quote(str(manager))}\n".encode()
+            digest = "sha256:" + hashlib.sha256(pkg).hexdigest()
+            release = {"draft": False, "prerelease": False, "tag_name": m.VERSION,
+                       "assets": [{"name": "wg-tun-native.sh", "digest": digest}]}
+            with patch.object(m, "INSTALLED_MANAGER", manager), patch.object(m, "fetch_release_file") as fetch, redirect_stdout(io.StringIO()):
+                fetch.side_effect = [json.dumps(release).encode(), b'bad download']
+                with self.assertRaisesRegex(m.Problem, 'SHA-256'):
+                    m.update_manager()
+                self.assertEqual(m.installed_version(), 'v1.1.0')
+                fetch.side_effect = [json.dumps(release).encode(), pkg]
+                self.assertTrue(m.update_manager())
+                self.assertEqual(m.installed_version(), m.VERSION)
+                fetch.side_effect = [json.dumps(release).encode()]
+                self.assertFalse(m.update_manager())
+                release["tag_name"] = "v1.0.0"
+                fetch.side_effect = [json.dumps(release).encode()]
+                self.assertFalse(m.update_manager())
+                self.assertEqual(m.installed_version(), m.VERSION)
 
 if __name__=='__main__':
     unittest.main()

@@ -12,6 +12,7 @@ cat > "$stage/manager.py" <<'WG_NATIVE_FILE_END'
 import base64
 import fcntl
 import getpass
+import hashlib
 import ipaddress
 import json
 import os
@@ -38,6 +39,9 @@ TABLE = "52970"
 MARK = "0xcb6a"
 PROTO = "237"
 BASE = 12500
+VERSION = "v1.2.0"
+INSTALLED_MANAGER = Path("/usr/local/lib/wg-tun/manager.py")
+REPOSITORY = "YJVIst/wg-tun"
 
 class Problem(Exception):
     pass
@@ -626,6 +630,58 @@ def create_profile():
     save_profile(("\n".join(values)+"\n").encode())
     print("请在上游登记本机公钥", call("wg","pubkey",data=(private+"\n").encode(),quiet=True).stdout.decode().strip())
 
+def version_number(tag):
+    if not isinstance(tag, str) or not re.fullmatch(r"v(?:0|[1-9][0-9]{0,7})(?:\.(?:0|[1-9][0-9]{0,7})){2}", tag):
+        raise Problem("无法识别管理脚本版本号")
+    return tuple(map(int, tag[1:].split(".")))
+
+def fetch_release_file(url, limit):
+    if not shutil.which("curl"):
+        raise Problem("更新管理脚本需要 curl，请安装 curl 后重试")
+    return call("curl", "-q", "--fail", "--silent", "--show-error", "--location",
+                "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "5",
+                "--max-time", "25", "--max-filesize", limit, url).stdout
+
+def installed_version():
+    return call("/usr/bin/python3", "-I", INSTALLED_MANAGER, "--version").stdout.decode().strip()
+
+def update_manager():
+    fd = os.open(INSTALLED_MANAGER.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Problem("已有管理脚本更新正在进行") from None
+        current = installed_version()
+        print(f"正在检查 {REPOSITORY} 的稳定版，已安装 {current}…", flush=True)
+        release = json.loads(fetch_release_file(f"https://api.github.com/repos/{REPOSITORY}/releases/latest", 1048576))
+        if not isinstance(release, dict) or release.get("draft") is not False or release.get("prerelease") is not False:
+            raise Problem("GitHub 未返回可用的稳定版")
+        tag = release.get("tag_name")
+        if version_number(tag) <= version_number(current):
+            print(f"已安装 {current}，无需更新。")
+            return current != VERSION
+        name = "wg-tun-native.sh"
+        assets = [a for a in release.get("assets", []) if a.get("name") == name]
+        if len(assets) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", assets[0].get("digest") or ""):
+            raise Problem("发布包缺少有效的 SHA-256 校验值，已取消更新")
+        print(f"正在下载 {tag}…", flush=True)
+        package = fetch_release_file(f"https://github.com/{REPOSITORY}/releases/download/{tag}/{name}", 4194304)
+        if "sha256:" + hashlib.sha256(package).hexdigest() != assets[0]["digest"]:
+            raise Problem("下载文件的 SHA-256 与发布记录不一致，已取消更新")
+        with tempfile.TemporaryDirectory(prefix="wg-tun-update-") as directory:
+            installer = Path(directory) / name
+            installer.write_bytes(package)
+            result = subprocess.run(["/bin/sh", str(installer)], check=False)
+            if result.returncode:
+                raise Problem(f"安装 {tag} 失败，请检查上方安装提示")
+        if installed_version() != tag:
+            raise Problem(f"安装后的版本与 {tag} 不一致，请检查安装结果")
+        print(f"管理脚本已从 {current} 更新到 {tag}。", flush=True)
+        return True
+    finally:
+        os.close(fd)
+
 def dispatch(cmd, args):
     if cmd == "configure":
         failure = RUN / "startup-error"
@@ -682,6 +738,8 @@ def dispatch(cmd, args):
         print(f"配置有效   地址 {len(addresses)}   Peer {wire.count(b'[Peer]')}   前缀 {len(routes)}   MTU {mtu}   DNS {len(dns)}")
     elif cmd == "mtu":
         change_mtu(args)
+    elif cmd == "update":
+        return update_manager()
     elif cmd == "doctor":
         doctor()
     elif cmd == "status":
@@ -702,7 +760,7 @@ MENU = (
     ("配置", (("import", "从文件导入配置"), ("create", "交互创建配置"), ("check", "校验当前配置"),
               ("mtu", "设置隧道 MTU"))),
     ("运维", (("enable", "开启开机启动"), ("disable", "关闭开机启动"),
-              ("routes", "诊断双栈与 SSH 路由"), ("logs", "查看近期日志"), ("doctor", "检查系统状态"))),
+              ("routes", "诊断双栈与 SSH 路由"), ("logs", "查看近期日志"), ("doctor", "检查系统状态"), ("update", "更新管理脚本"))),
 )
 
 def public_ip(family):
@@ -751,7 +809,7 @@ def menu():
     actions = [cmd for _, items in MENU for cmd, _ in items]
     refresh_at = 0
     while True:
-        print("\n" + styled("━━  WireGuard  /  原生内核管理  ━━", "1;36"))
+        print("\n" + styled(f"━━  WireGuard  /  原生内核管理  {VERSION}  ━━", "1;36"))
         try:
             menu_overview()
         except (ValueError, OSError, Problem, subprocess.SubprocessError):
@@ -777,7 +835,9 @@ def menu():
             action = actions[int(choice)-1]
             if action in ("start", "restart", "stop", "import", "create"):
                 refresh_at = 0
-            dispatch(action, [])
+            changed = dispatch(action, [])
+            if action == "update" and changed:
+                os.execv("/usr/bin/python3", ["python3", "-I", str(INSTALLED_MANAGER)])
         except (ValueError, OSError, Problem, subprocess.SubprocessError) as e:
             print(styled("操作失败  ", "31") + str(e), file=sys.stderr)
 
@@ -785,6 +845,9 @@ def main():
     os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
     os.environ["LC_ALL"] = "C"
     os.umask(0o077)
+    if sys.argv[1:] in (["--version"], ["version"]):
+        print(VERSION)
+        return
     if sys.argv[1:] in (["-h"], ["--help"], ["help"]):
         print("wg 打开菜单    wg menu <命令>    wg-tun [命令]")
         for _, items in MENU:
@@ -910,12 +973,12 @@ install -d -m 0700 /etc/wg-tun
 next_manager=$(mktemp "$lib/.manager.XXXXXXXX")
 trap 'rm -f "$next_manager"' EXIT
 install -m 0755 manager.py "$next_manager"
-mv -f "$next_manager" "$lib/manager.py"
 install -m 0755 wg "$lib/wg"
 ln -sfn "$lib/manager.py" "$bin"
 ln -sfn "$lib/wg" /usr/local/bin/wg
 install -m 0644 systemd/wg-tun.service "$units/"
 systemctl daemon-reload
+mv -f "$next_manager" "$lib/manager.py"
 echo '原生 WireGuard 管理器已安装。输入 wg 即可打开中文菜单。'
 WG_NATIVE_FILE_END
 sh "$stage/install.sh"
