@@ -7,7 +7,7 @@
 在 Debian 13 的 root 终端运行以下命令。有 sudo 权限的普通用户可先运行 `sudo -i`。
 
 ~~~sh
-apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wireguard-tools iproute2 python3 util-linux mount
+apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wireguard-tools iproute2 nftables python3 util-linux mount
 curl -fsSL https://raw.githubusercontent.com/YJVIst/wg-tun/v1.2.0/wg-tun-native.sh -o wg-tun-native.sh && sh ./wg-tun-native.sh
 hash -r
 wg
@@ -15,7 +15,7 @@ wg
 
 下载命令固定使用 v1.2.0。以后再次打开管理菜单，直接输入 `wg` 即可。
 
-使用项目源码安装时，可在项目目录运行 `sudo sh install.sh`。安装需要运行 systemd 的 Debian 13、具有网络管理权限的 root，以及提供 WireGuard 驱动的内核。安装保留现有配置。当前原生版本可以在服务单元相同且接口归属可验证时在线更新管理器。若使用旧 Rust 版，先运行 `sudo wg-tun stop`，升级后按需开启开机启动。
+使用项目源码安装时，可在项目目录运行 `sudo sh install.sh`。本次代理回程修复已包含在当前源码安装包中。安装需要运行 systemd 的 Debian 13、具有网络管理权限的 root，以及提供 WireGuard 驱动的内核。安装保留现有配置。当前原生版本可以在服务单元相同且接口归属可验证时在线更新管理器。若使用旧 Rust 版，先运行 `sudo wg-tun stop`，升级后按需开启开机启动。
 
 | 输入 | 用途 |
 | --- | --- |
@@ -71,8 +71,9 @@ wg menu enable
 ## 网络行为
 
 - `AllowedIPs` 控制本机哪些目标经隧道出站。支持 IPv4、IPv6、双栈、多个 Peer 和按前缀分流。没有对应隧道路由的目标继续使用系统路由。
-- 管理器在专用表 52970 中安装路由，主路由表保留。TCP 源端口或目的端口为 22 的连接走原网络，涵盖服务器对 SSH 入站连接的回复，以及本机发起的 SSH 连接。其他端口的入站业务回包也可能受全隧道路由影响。
+- 管理器在专用表 52970 中安装路由，主路由表保留。TCP 源端口或目的端口为 22 的连接走原网络，涵盖服务器对 SSH 入站连接的回复，以及本机发起的 SSH 连接。公网客户端连入本机 Xray、sing-box 等代理时，入站 TCP/UDP 连接的回包走系统原路由。代理为客户端新建的出站连接按 AllowedIPs 路由，经隧道发出的包使用隧道地址。端口无需登记，代理可在隧道启动后运行。
 - WireGuard 的外层 UDP 使用路由标记。已解析端点的 UDP 流量走原网络。遇到同名接口、地址冲突、专用表占用或相关地址族已有自定义策略路由时，启动会报告冲突。接口清理按创建时记录的归属执行。
+- 管理器使用独立的临时 nftables 表，由内核跟踪连接方向，停止隧道时删除该表。已运行的旧隧道在更新管理器后需运行一次 `wg menu restart` 应用新规则。
 - 配置 DNS 时，按当前系统使用 systemd-resolved、resolvconf 或临时绑定挂载。停止后恢复。省略 DNS 时沿用主机设置。
 - 可导入字段包括 Address、PrivateKey、ListenPort、MTU、DNS、PublicKey、PresharedKey、AllowedIPs、Endpoint、PersistentKeepalive。DNS 接受 IP 地址。上游可使用域名、IPv4 或带方括号的 IPv6 端点。配置中的脚本钩子会被拒绝。
 - 本工具管理本机的三层出站隧道。转发其他设备的流量、NAT 或提供应用层代理需要单独配置。

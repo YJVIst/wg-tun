@@ -154,7 +154,25 @@ m.main()
                 def route(dst,*args):return host('ip','-'+str(family),'-j','route','get',dst,*args).stdout
                 assert json.loads(route(src,'ipproto','tcp','sport','22','dport','45000'))[0]['dev']=='mgmt0'
                 assert json.loads(route(src,'ipproto','tcp','sport','45000','dport','22'))[0]['dev']=='mgmt0'
-                assert json.loads(route(src))[0]['dev']=='wgtun0'
+                assert json.loads(route(src,'mark','0x40000000'))[0]['dev']=='wgtun0'
+            if fixture == 'synthetic':
+                helper = Path(__file__).resolve().with_name('flow_trial.py')
+                for family, client_ip, native, upstream, expected in [
+                    (4, '198.51.100.9', '10.90.0.1', '10.79.0.1', '10.79.0.2'),
+                    (6, '2001:db8:2::9', 'fd42:90::1', 'fd42:79::1', 'fd42:79::2'),
+                ]:
+                    for proto in ('tcp', 'udp'):
+                        def listen(namespace, role, addr, *target):
+                            ready = d/f'{role}-{family}-{proto}'
+                            proc = spawn(stack, [*namespace, 'python3', helper, role, proto, addr, ready, *target], log)
+                            assert wait_for(lambda: ready.exists() and ready.stat().st_size)
+                            return proc, ready.read_text()
+                        sink, sink_port = listen(client, 'upstream', upstream)
+                        proxy, port = listen(enter, 'proxy', '::' if family == 6 else '0.0.0.0', upstream, sink_port)
+                        result = remote('python3', helper, 'client', proto, client_ip, native, port)
+                        assert result.stdout.decode().strip() == expected + ' return-path'
+                        assert proxy.wait(3) == sink.wait(3) == 0
+                        report[f'proxyIPv{family}{proto.upper()}'] = True
             assert dns()!=initial
             report['dnsApplied']=True
             if fixture.startswith('upstream'):
@@ -211,6 +229,7 @@ m.main()
             for x in ['-4','-6']:
                 assert b'1250' not in host('ip',x,'rule').stdout
             assert host('ip','link','show','wgtun0',check=False).returncode!=0
+            assert b'wgtun_' not in host('nft','list','tables').stdout
             report['cleanRestore']=True
             if fixture in ('synthetic', 'health'):
                 file = d/'profile'

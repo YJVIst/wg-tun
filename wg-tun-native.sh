@@ -37,9 +37,10 @@ DEV = "wgtun0"
 UNIT = "wg-tun.service"
 TABLE = "52970"
 MARK = "0xcb6a"
+EGRESS_BIT = "0x40000000"
 PROTO = "237"
 BASE = 12500
-VERSION = "v1.2.0"
+VERSION = "v1.2.1"
 INSTALLED_MANAGER = Path("/usr/local/lib/wg-tun/manager.py")
 REPOSITORY = "YJVIst/wg-tun"
 
@@ -174,7 +175,7 @@ def profile():
 def ip(family, *args, **kwargs):
     return call("ip", "-" + str(family), *args, **kwargs)
 
-def rules(family, endpoints=()):
+def rules(family, endpoints=(), addresses=()):
     # The nop target resumes the host's original routing policy for SSH and outer UDP.
     end = str(BASE + 9)
     entries = [
@@ -186,9 +187,46 @@ def rules(family, endpoints=()):
         # the route back to the peer, without the outbound socket mark.
         *((2, ["to", str(addr), "ipproto", "udp", "goto", end])
           for addr in endpoints if addr.version == family),
-        (3, ["iif", "lo", "lookup", TABLE]),
+        # The first lookup supplies the native source for an unbound UDP
+        # reply. OUTPUT then reroutes locally initiated TCP/UDP via WG.
+        (3, ["iif", "lo", "fwmark", f"{EGRESS_BIT}/{EGRESS_BIT}", "lookup", TABLE]),
+        *((3, ["iif", "lo", "from", str(a.ip), "lookup", TABLE])
+          for a in addresses if a.version == family),
+        *((4, ["iif", "lo", "ipproto", proto, "lookup", "main"]) for proto in ("tcp", "udp")),
+        (5, ["iif", "lo", "lookup", TABLE]),
     ]
     return [["pref", str(BASE + offset), *body, "protocol", PROTO] for offset, body in entries]
+
+def install_flow_routing(state, addresses, families):
+    # A private, per-run table can be removed without touching host firewall rules.
+    table = "wgtun_" + secrets.token_hex(12)
+    state["nft_table"] = table
+    owned(state)
+    lines = [
+        f"create table inet {table}",
+        f"add chain inet {table} select_path {{ type route hook output priority mangle; policy accept; }}",
+        f"add chain inet {table} source_nat {{ type nat hook postrouting priority srcnat - 1; policy accept; }}",
+    ]
+    for family in families:
+        nfproto = "ipv4" if family == 4 else "ipv6"
+        header = "ip" if family == 4 else "ip6"
+        sources = ", ".join(str(a.ip) for a in addresses if a.version == family)
+        match = f"meta nfproto {nfproto} meta l4proto {{ tcp, udp }}"
+        chain = f"add rule inet {table} select_path {match}"
+        lines.extend([
+            f"{chain} ct direction reply return",
+            f"{chain} meta mark != {MARK} meta mark set meta mark | {EGRESS_BIT}",
+            f"add rule inet {table} source_nat {match} oifname \"{DEV}\" "
+            f"meta mark & {EGRESS_BIT} != 0 {header} saddr != {{ {sources} }} masquerade",
+        ])
+    call("nft", "-f", "-", data=("\n".join(lines) + "\n").encode())
+
+def remove_flow_routing(state):
+    table = state.get("nft_table")
+    if table:
+        if not re.fullmatch(r"wgtun_[0-9a-f]{24}", table):
+            raise Problem("无效的防火墙归属记录")
+        call("nft", "destroy", "table", "inet", table)
 
 def dns_method():
     resolver = Path("/etc/resolv.conf")
@@ -378,8 +416,14 @@ def configure():
         ip(route.version, "route", "add", str(route), "dev", DEV, "table", TABLE)
     peers = call("wg", "show", DEV, "endpoints").stdout.decode().splitlines()
     endpoints = {ipaddress.ip_address(line.split()[1].rsplit(":", 1)[0].strip("[]")) for line in peers}
-    for fam in sorted({r.version for r in routes}):
-        for spec in rules(fam, endpoints):
+    families = sorted({r.version for r in routes})
+    install_flow_routing(state, addresses, families)
+    if 4 in families:
+        # Decrypted replies may arrive through WG for a connection whose first
+        # source lookup used the native NIC. Only relax checks on our device.
+        Path(f"/proc/sys/net/ipv4/conf/{DEV}/rp_filter").write_text("2\n")
+    for fam in families:
+        for spec in rules(fam, endpoints, addresses):
             state["rules"].append([fam, spec])
             owned(state)
             ip(fam, "rule", "add", *spec)
@@ -397,6 +441,7 @@ def cleanup():
         r = ip(fam, "rule", "del", *spec, check=False)
         if r.returncode and b"No such file" not in r.stderr and b"No such process" not in r.stderr:
             raise Problem("清理专用规则失败 " + r.stderr.decode().strip())
+    remove_flow_routing(state)
     restore_dns(state)
     if owned_link(state):
         call("ip", "link", "delete", "dev", DEV)
@@ -471,7 +516,7 @@ def system_checks():
         yield "内核驱动", "正常", "WireGuard 模块可用，创建接口时按需加载"
     else:
         yield "内核驱动", "提示", "未从 sysfs 或模块索引确认 WireGuard 支持，请核对运行内核配置"
-    required = ("ip", "wg", "python3", "systemctl", "mount", "umount", "findmnt", "journalctl")
+    required = ("ip", "nft", "wg", "python3", "systemctl", "mount", "umount", "findmnt", "journalctl")
     missing = [name for name in required if not shutil.which(name)]
     yield "管理工具", "异常" if missing else "正常", "缺少 " + ", ".join(missing) if missing else "依赖齐全"
     if not shutil.which("curl"):
@@ -748,9 +793,15 @@ def dispatch(cmd, args):
         subprocess.run(["journalctl", "--no-pager", "-u", UNIT, "-n", "45"], check=True)
     elif cmd == "routes":
         for fam, probe in [(4, "192.0.2.1"), (6, "2001:db8::1")]:
-            for args in [[], ["ipproto", "tcp", "sport", "22", "dport", "45000"], ["ipproto", "tcp", "sport", "45000", "dport", "22"], ["mark", MARK]]:
+            for label, args in [
+                ("代理新建出站", ["mark", EGRESS_BIT, "ipproto", "tcp"]),
+                ("公网入站连接回包", ["ipproto", "tcp", "sport", "443", "dport", "45000"]),
+                ("SSH 入站回包", ["ipproto", "tcp", "sport", "22", "dport", "45000"]),
+                ("SSH 出站", ["ipproto", "tcp", "sport", "45000", "dport", "22"]),
+                ("WireGuard 外层", ["mark", MARK]),
+            ]:
                 r = ip(fam, "route", "get", probe, *args, check=False)
-                print("IPv" + str(fam), " ".join(args) or "普通流量", (r.stdout or r.stderr).decode().strip())
+                print("IPv" + str(fam), label, (r.stdout or r.stderr).decode().strip())
     else:
         raise Problem("未知命令")
 
@@ -921,8 +972,8 @@ test "$(id -u)" = 0 || { echo '请以 root 或 sudo 安装'; exit 1; }
 . /etc/os-release
 test "$ID/$VERSION_ID" = debian/13 || { echo '本安装器适用于 Debian 13'; exit 1; }
 test -x /usr/bin/wg || { echo "请先安装 wireguard-tools"; exit 1; }
-for tool in ip python3 systemctl mount umount findmnt journalctl; do
-    command -v "$tool" >/dev/null || { echo "缺少 $tool。请运行 apt-get install --no-install-recommends iproute2 wireguard-tools python3 util-linux mount systemd"; exit 1; }
+for tool in ip nft python3 systemctl mount umount findmnt journalctl; do
+    command -v "$tool" >/dev/null || { echo "缺少 $tool。请运行 apt-get install --no-install-recommends iproute2 nftables wireguard-tools python3 util-linux mount systemd"; exit 1; }
 done
 lib=/usr/local/lib/wg-tun
 bin=/usr/local/bin/wg-tun

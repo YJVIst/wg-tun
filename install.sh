@@ -5,8 +5,8 @@ test "$(id -u)" = 0 || { echo '请以 root 或 sudo 安装'; exit 1; }
 . /etc/os-release
 test "$ID/$VERSION_ID" = debian/13 || { echo '本安装器适用于 Debian 13'; exit 1; }
 test -x /usr/bin/wg || { echo "请先安装 wireguard-tools"; exit 1; }
-for tool in ip python3 systemctl mount umount findmnt journalctl; do
-    command -v "$tool" >/dev/null || { echo "缺少 $tool。请运行 apt-get install --no-install-recommends iproute2 wireguard-tools python3 util-linux mount systemd"; exit 1; }
+for tool in ip nft python3 systemctl mount umount findmnt journalctl; do
+    command -v "$tool" >/dev/null || { echo "缺少 $tool。请运行 apt-get install --no-install-recommends iproute2 nftables wireguard-tools python3 util-linux mount systemd"; exit 1; }
 done
 lib=/usr/local/lib/wg-tun
 bin=/usr/local/bin/wg-tun

@@ -13,3 +13,4 @@
 /tests/*
 !/tests/config_test.py
 !/tests/node_trial.py
+!/tests/flow_trial.py
