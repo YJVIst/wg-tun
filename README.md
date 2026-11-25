@@ -8,14 +8,14 @@
 
 ~~~sh
 apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wireguard-tools iproute2 nftables python3 util-linux mount
-curl -fsSL https://raw.githubusercontent.com/YJVIst/wg-tun/v1.2.0/wg-tun-native.sh -o wg-tun-native.sh && sh ./wg-tun-native.sh
+curl -fsSL https://raw.githubusercontent.com/YJVIst/wg-tun/v1.2.1/wg-tun-native.sh -o wg-tun-native.sh && sh ./wg-tun-native.sh
 hash -r
 wg
 ~~~
 
-下载命令固定使用 v1.2.0。以后再次打开管理菜单，直接输入 `wg` 即可。
+下载命令固定使用 v1.2.1。以后再次打开管理菜单，直接输入 `wg` 即可。
 
-使用项目源码安装时，可在项目目录运行 `sudo sh install.sh`。本次代理回程修复已包含在当前源码安装包中。安装需要运行 systemd 的 Debian 13、具有网络管理权限的 root，以及提供 WireGuard 驱动的内核。安装保留现有配置。当前原生版本可以在服务单元相同且接口归属可验证时在线更新管理器。若使用旧 Rust 版，先运行 `sudo wg-tun stop`，升级后按需开启开机启动。
+使用项目源码安装时，可在项目目录运行 `sudo sh install.sh`。安装需要运行 systemd 的 Debian 13、具有网络管理权限的 root，以及提供 WireGuard 驱动的内核。安装保留现有配置。当前原生版本可以在服务单元相同且接口归属可验证时在线更新管理器。若使用旧 Rust 版，先运行 `sudo wg-tun stop`，升级后按需开启开机启动。
 
 | 输入 | 用途 |
 | --- | --- |
@@ -36,6 +36,8 @@ wg
 ## 更新管理脚本
 
 输入 `wg`，在「运维」中选择「更新管理脚本」，或运行 `wg menu update`。脚本会比较已安装版本和 GitHub 最新稳定版，下载新版并核对 GitHub 发布资产的 SHA-256。完成后，交互菜单会加载新版。配置及开机启动设置沿用本机原值。如果新版变更了正在运行的服务单元，安装器会提示先停止隧道。
+
+从 v1.2.0 升级时，先用 `command -v nft` 检查依赖。若缺少该命令，运行 `apt-get install -y --no-install-recommends nftables`。执行 `wg menu update` 后，已运行的隧道再执行一次 `wg menu restart` 即可应用代理回程规则。
 
 v1.0.0 和 v1.1.0 首次升级需执行上方「安装与打开」中的下载安装命令，之后即可使用菜单更新。
 
