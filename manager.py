@@ -67,6 +67,30 @@ def number(s, low, high):
         raise Problem("端口、MTU 或保活时间超出范围")
     return int(s)
 
+def endpoint_parts(endpoint):
+    host, sep, port = endpoint.rpartition(":")
+    if not sep or not host or not port:
+        raise Problem("上游 Endpoint 需要填写域名:端口、IPv4:端口或 [IPv6]:端口")
+    port = number(port, 1, 65535)
+    if host.startswith("[") and host.endswith("]"):
+        if "%" in host:
+            raise Problem("上游 IPv6 地址不支持接口范围标记")
+        return str(ipaddress.IPv6Address(host[1:-1])), port
+    try:
+        return str(ipaddress.IPv4Address(host)), port
+    except ValueError:
+        pass
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        raise Problem("上游域名编码无效") from None
+    name = host.removesuffix(".")
+    if (len(name) > 253 or not name or
+            any(not re.fullmatch(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?", label)
+                for label in name.split("."))):
+        raise Problem("上游域名无效，IPv6 地址请放在方括号内")
+    return host, port
+
 def config(raw):
     if len(raw) > 128 * 1024:
         raise Problem("配置超过 128 KiB")
@@ -119,13 +143,7 @@ def config(raw):
             validate_key(peer["PresharedKey"])
         if "PersistentKeepalive" in peer:
             number(peer["PersistentKeepalive"], 0, 65535)
-        endpoint = peer.get("Endpoint", "")
-        match = re.fullmatch(r"(?:\[([a-fA-F0-9:]+)\]|([a-zA-Z0-9._-]+)):([0-9]+)", endpoint)
-        if not match:
-            raise Problem("出口模式需要每个 Peer 都有 Endpoint（主机:端口，IPv6 使用方括号）")
-        if match[1]:
-            ipaddress.IPv6Address(match[1])
-        number(match[3], 1, 65535)
+        endpoint_parts(peer.get("Endpoint", ""))
         for item in items(peer.get("AllowedIPs", "")):
             route = ipaddress.ip_network(item, strict=True)
             if route.version not in families or route in routes:
@@ -239,7 +257,49 @@ def peer_fields(field):
     rows = call("wg", "show", DEV, field).stdout.decode().splitlines()
     return dict(row.split(maxsplit=1) for row in rows)
 
-def verify_upstreams(expected, timeout=15):
+def peer_endpoints(wire):
+    result = {}
+    for section in wire.decode().split("[Peer]")[1:]:
+        fields = dict(line.split(" = ", 1) for line in section.strip().splitlines())
+        result[fields["PublicKey"]] = fields["Endpoint"]
+    return result
+
+def resolve_endpoints(expected):
+    cache, candidates = {}, {}
+    deadline = time.monotonic() + 8
+    for key, endpoint in expected.items():
+        host, port = endpoint_parts(endpoint)
+        try:
+            addresses = [ipaddress.ip_address(host)]
+        except ValueError:
+            if host not in cache:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise UpstreamProblem(f"解析上游域名 {host} 超时")
+                try:
+                    result = call("getent", "ahosts", "--", host, check=False, timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    raise UpstreamProblem(f"解析上游域名 {host} 超时") from None
+                addresses = []
+                for row in result.stdout.decode().splitlines():
+                    fields = row.split()
+                    if len(fields) >= 2 and fields[1] == "DGRAM":
+                        address = ipaddress.ip_address(fields[0])
+                        if address not in addresses:
+                            addresses.append(address)
+                if not addresses:
+                    raise UpstreamProblem(f"上游域名 {host} 未解析到可用的 IPv4 或 IPv6 地址")
+                # Try the other family early when the preferred transport is down.
+                other = next((a for a in addresses if a.version != addresses[0].version), None)
+                if other is not None:
+                    addresses.remove(other)
+                    addresses.insert(1, other)
+                cache[host] = addresses
+            addresses = cache[host]
+        candidates[key] = [f"[{a}]:{port}" if a.version == 6 else f"{a}:{port}" for a in addresses]
+    return candidates
+
+def verify_upstreams(expected, candidates, timeout=15):
     endpoints = peer_fields("endpoints")
     if set(endpoints) != set(expected):
         absent = ", ".join(expected[k] for k in expected.keys() - endpoints.keys())
@@ -255,6 +315,8 @@ def verify_upstreams(expected, timeout=15):
             call("wg", "set", DEV, *args)
     changed = {key: value for key, value in original.items() if value != "1"}
     keepalive(dict.fromkeys(changed, "1"))
+    remaining = {key: iter(values[1:]) for key, values in candidates.items()}
+    next_candidate = time.monotonic() + 4
     until = time.monotonic() + timeout
     while True:
         times = peer_fields("latest-handshakes")
@@ -265,6 +327,12 @@ def verify_upstreams(expected, timeout=15):
         if time.monotonic() >= until:
             names = ", ".join(expected[key] for key in pending)
             raise UpstreamProblem(f"上游 {names} 在 {timeout} 秒内未完成 WireGuard 握手")
+        if time.monotonic() >= next_candidate:
+            for key in pending:
+                candidate = next(remaining[key], None)
+                if candidate is not None:
+                    call("wg", "set", DEV, "peer", key, "endpoint", candidate)
+            next_candidate += 5.5
         time.sleep(0.5)
 
 def configure():
@@ -275,11 +343,12 @@ def configure():
     call("ip", "link", "set", "dev", state["temporary"], "name", DEV, "alias", state["alias"])
     if not owned_link(state):
         raise Problem("无法验证原生接口的类型与归属")
-    expected = {}
-    for section in wire.decode().split("[Peer]")[1:]:
-        fields = dict(line.split(" = ", 1) for line in section.strip().splitlines())
-        expected[fields["PublicKey"]] = fields["Endpoint"]
-    os.environ["WG_ENDPOINT_RESOLUTION_RETRIES"] = "0"
+    expected = peer_endpoints(wire)
+    candidates = resolve_endpoints(expected)
+    first = {endpoint.encode(): candidates[key][0].encode() for key, endpoint in expected.items()}
+    # Keep the original hostname on disk. Only numeric endpoints reach the kernel.
+    wire = b"\n".join(b"Endpoint = " + first[line.removeprefix(b"Endpoint = ")] if line.startswith(b"Endpoint = ") else line
+                      for line in wire.split(b"\n"))
     try:
         call("wg", "setconf", DEV, "/dev/stdin", data=wire, quiet=True)
     except (Problem, subprocess.TimeoutExpired):
@@ -288,7 +357,7 @@ def configure():
     if int(actual_mark, 0) != int(MARK, 0):
         raise Problem("WireGuard 外层报文标记未生效")
     call("ip", "link", "set", "dev", DEV, "mtu", mtu, "up")
-    verify_upstreams(expected)
+    verify_upstreams(expected, candidates)
     for a in addresses:
         ip(a.version, "address", "add", str(a), "dev", DEV, "noprefixroute",
            *(["nodad"] if a.version == 6 else []))
@@ -348,7 +417,7 @@ def status():
         print("  配置      等待导入，可使用 wg menu import <路径>")
         return
     raw = profile()
-    addr, routes, mtu, dns, _ = config(raw)
+    addr, routes, mtu, dns, wire = config(raw)
     print("  地址     ", ", ".join(map(str, addr)), "   MTU", mtu)
     print("  路由     ", ", ".join(map(str, routes)))
     print("  DNS      ", ", ".join(dns) if dns else "跟随系统")
@@ -357,12 +426,15 @@ def status():
     state = json.loads(STATE.read_bytes()) if STATE.is_file() else {}
     if not owned_link(state):
         raise Problem("服务与接口状态不一致，请查看日志后重启")
+    configured = peer_endpoints(wire)
     handshakes, traffic = peer_fields("latest-handshakes"), peer_fields("transfer")
     for key, endpoint in peer_fields("endpoints").items():
         stamp = int(handshakes[key])
         age = f"{max(0, int(time.time())-stamp)} 秒前" if stamp else "尚未握手"
         rx, tx = map(int, traffic[key].split())
-        print(f"  Peer      {endpoint}   {key[:8]}…")
+        source = configured.get(key, endpoint)
+        label = endpoint if source == endpoint else f"{source} → {endpoint}"
+        print(f"  Peer      {label}   {key[:8]}…")
         print(f"            握手 {age}   ↓ {volume(rx)}   ↑ {volume(tx)}")
 
 def host_resources():
@@ -528,7 +600,7 @@ def create_profile():
     addresses = input("本机隧道地址与前缀，多地址用逗号分隔 > ").strip()
     families = {ipaddress.ip_interface(x.strip()).version for x in addresses.split(",")}
     allowed = ",".join(n for fam,n in ((4,"0.0.0.0/0"),(6,"::/0")) if fam in families)
-    endpoint = input("上游 Endpoint（主机:端口） > ").strip()
+    endpoint = input("上游端点（如 vpn.example.com:51820、IPv4:端口或 [IPv6]:端口） > ").strip()
     peer = input("上游公钥 > ").strip()
     private = getpass.getpass("本机私钥（留空生成新密钥） > ").strip()
     if not private:

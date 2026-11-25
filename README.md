@@ -8,12 +8,12 @@
 
 ~~~sh
 apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wireguard-tools iproute2 python3 util-linux mount
-curl -fsSL https://raw.githubusercontent.com/YJVIst/wg-tun/v1.0.0/wg-tun-native.sh -o wg-tun-native.sh && sh ./wg-tun-native.sh
+curl -fsSL https://raw.githubusercontent.com/YJVIst/wg-tun/v1.1.0/wg-tun-native.sh -o wg-tun-native.sh && sh ./wg-tun-native.sh
 hash -r
 wg
 ~~~
 
-下载命令固定使用 v1.0.0。以后再次打开管理菜单，直接输入 `wg` 即可。
+下载命令固定使用 v1.1.0。以后再次打开管理菜单，直接输入 `wg` 即可。
 
 使用项目源码安装时，可在项目目录运行 `sudo sh install.sh`。安装需要运行 systemd 的 Debian 13、具有网络管理权限的 root，以及提供 WireGuard 驱动的内核。安装保留现有配置。当前原生版本可以在服务单元相同且接口归属可验证时在线更新管理器。若使用旧 Rust 版，先运行 `sudo wg-tun stop`，升级后按需开启开机启动。
 
@@ -49,6 +49,12 @@ wg menu enable
 ~~~
 
 使用 `wg menu stop` 立即恢复网络，`wg menu disable` 关闭开机启动，`wg menu logs` 查看隧道服务日志。更换配置时先停止，再导入。开机启动设置在更换配置后继续生效。配置保存在 root 专用的 `/etc/wg-tun/tunnel.conf`，状态页仅展示公开信息。
+
+## 使用域名节点
+
+在「交互创建配置」的上游端点一栏填写 `vpn.example.com:51820`，也可在导入文件的 `[Peer]` 段填写 `Endpoint = vpn.example.com:51820`。域名可含中文，端口为上游实际监听的 UDP 端口。
+
+启动时通过系统解析器查询域名，支持 IPv4、IPv6 和多地址记录。首选地址未响应时，管理器在原有 15 秒握手窗口内尝试候选地址。运行 `wg menu status` 可查看配置域名和内核当前使用的端点。域名记录变更后，运行 `wg menu restart` 重新解析并连接。
 
 ## MTU 设置
 

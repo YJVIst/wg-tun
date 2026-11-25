@@ -121,6 +121,13 @@ m.main()
             remote('ip','-6','addr','add','fd42:79::1/64','dev','wire0','nodad')
             remote('ip','link','set','wire0','up')
             (d/'profile').write_text(f"[Interface]\nAddress=10.79.0.2/32,fd42:79::2/128\nPrivateKey={priv.decode().strip()}\nDNS=1.1.1.1\n[Peer]\nPublicKey={pub_server}\nEndpoint=10.90.0.2:41513\nAllowedIPs=0.0.0.0/0,::/0\n")
+        if fixture == 'domain':
+            hosts = d/'hosts'
+            hosts.write_text("127.0.0.1 localhost\n10.90.0.1 wg-peer.test\n10.90.0.2 wg-peer.test\n")
+            host('mount','--bind',hosts,'/etc/hosts')
+            assert host('getent','ahosts','wg-peer.test').stdout.split()[0] == b'10.90.0.1'
+            file = d/'profile'
+            file.write_bytes(file.read_bytes().replace(b'Endpoint=10.90.0.2:', b'Endpoint=wg-peer.test:'))
         (d/'profile').chmod(0o600)
         file=services/(unit+'.service')
         file.write_text(main)
@@ -183,7 +190,15 @@ m.main()
                 host('ping','-6','-c','1','-W','5','fd42:79::1')
                 assert existing_ssh()
                 report['continuousSeconds']=int(time.monotonic()-started)
+            if fixture == 'domain':
+                assert 'wg-peer.test:41513 → 10.90.0.2:41513' in status
+                hosts.write_text("127.0.0.1 localhost\nfd42:90::2 wg-peer.test\n")
             host('python3',rpc,'restart')
+            if fixture == 'domain':
+                assert host('wg','show','wgtun0','endpoints').stdout.split()[1] == b'[fd42:90::2]:41513'
+                host('ping','-6','-c','1','-W','3','fd42:79::1')
+                assert b'Endpoint=wg-peer.test:41513' in (d/'profile').read_bytes()
+                report['domainFallbackAndReresolution']=True
             assert json.loads(host('ip','-j','link','show','dev','wgtun0').stdout)[0]['mtu']==1280
             assert existing_ssh()
             host('python3',rpc,'stop')

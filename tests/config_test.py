@@ -40,6 +40,25 @@ class ConfigTests(unittest.TestCase):
         v4 = TEXT.replace(',fd01::1/128', '').replace(',::/0', '').encode()
         self.assertEqual(m.config(m.with_mtu(v4, '576'))[2], 576)
 
+    def test_domain_endpoints(self):
+        self.assertEqual(m.endpoint_parts('节点.example.:51820'), ('xn--3px729a.example.', 51820))
+        text = TEXT.replace('[2001:db8::1]:51820', 'vpn.example.org:443')
+        self.assertEqual(m.peer_endpoints(m.config(text.encode())[-1])[KEY], 'vpn.example.org:443')
+        for invalid in ('https://vpn.example:123', 'vpn..example:10', '2001:db8::1:10', 'host:0'):
+            with self.assertRaises((ValueError, m.Problem)):
+                m.endpoint_parts(invalid)
+
+    def test_dns_lookup_is_cached_and_failure_names_the_host(self):
+        records = b'192.0.2.1 DGRAM\n192.0.2.1 STREAM\n192.0.2.2 DGRAM\n2001:db8::1 DGRAM\n'
+        with patch.object(m, 'call', return_value=CompletedProcess([], 0, records)) as fetch:
+            peers = m.resolve_endpoints({'a': 'vpn.test:123', 'b': 'vpn.test:456'})
+            self.assertEqual(peers['a'], ['192.0.2.1:123', '[2001:db8::1]:123', '192.0.2.2:123'])
+            self.assertEqual(peers['b'][1], '[2001:db8::1]:456')
+            self.assertEqual(fetch.call_count, 1)
+            fetch.return_value = CompletedProcess([], 2, b'')
+            with self.assertRaisesRegex(m.UpstreamProblem, 'missing.test'):
+                m.resolve_endpoints({'a': 'missing.test:42'})
+
     def test_rule_order(self):
         for family in (4,6):
             specs=m.rules(family)
