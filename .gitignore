@@ -1,0 +1,15 @@
+# Publish only the native manager, its documentation and reproducible tests.
+/*
+!/.gitignore
+!/README.md
+!/install.sh
+!/manager.py
+!/wg
+!/wg-tun-native.sh
+!/systemd/
+/systemd/*
+!/systemd/wg-tun.service
+!/tests/
+/tests/*
+!/tests/config_test.py
+!/tests/node_trial.py

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Preserve the Debian CLI for subcommands and unattended scripts.
+if [ "${1-}" = menu ]; then
+    shift
+elif [ "$#" -gt 0 ] || ! [ -t 0 ] || ! [ -t 1 ]; then
+    exec /usr/bin/wg "$@"
+fi
+
+if [ "$(id -u)" != 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo -- /usr/local/lib/wg-tun/manager.py "$@"
+    fi
+    echo '请以 root 运行 wg 打开管理菜单。' >&2
+    exit 1
+fi
+exec /usr/local/lib/wg-tun/manager.py "$@"

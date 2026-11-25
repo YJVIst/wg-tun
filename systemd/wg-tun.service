@@ -1,0 +1,23 @@
+[Unit]
+Description=Native WireGuard outbound tunnel
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/wg-tun/tunnel.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=wg-tun
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+ExecStart=/usr/local/lib/wg-tun/manager.py configure
+ExecStopPost=/usr/local/lib/wg-tun/manager.py cleanup
+TimeoutStartSec=60
+TimeoutStopSec=30
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target
